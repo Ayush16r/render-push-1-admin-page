@@ -6,10 +6,18 @@ import os, time, json
 
 app = Flask(__name__)
 
-# --- CONFIG ---
-MONGODB_URI = os.getenv("MONGODB_URI", "mongodb+srv://ayush16r:Ayush16r@healxtrail.nlpleiz.mongodb.net/?retryWrites=true&w=majority&appName=HealXtrail")
-DB_NAME = os.getenv("DB_NAME", "mydb")   # your DB
-COLL = "bookings"                       # your collection
+# ---------------- MongoDB Setup ----------------
+
+MONGO_URI = os.environ.get("MONGO_URI")
+if not MONGO_URI:
+    raise Exception("Please set the MONGO_URI environment variable in Render")
+
+
+
+# # --- CONFIG ---
+# MONGODB_URI = os.getenv("MONGODB_URI", "mongodb+srv://ayush16r:Ayush16r@healxtrail.nlpleiz.mongodb.net/?retryWrites=true&w=majority&appName=HealXtrail")
+# DB_NAME = os.getenv("DB_NAME", "mydb")   # your DB
+# COLL = "bookings"                       # your collection
 
 client = MongoClient(MONGODB_URI)
 db = client[DB_NAME]
