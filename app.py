@@ -7,19 +7,14 @@ import os, time, json
 app = Flask(__name__)
 
 # ---------------- MongoDB Setup ----------------
+MONGO_URI = os.environ.get("MONGO_URI")
+DB_NAME = os.environ.get("DB_NAME", "mydb")       # default DB = mydb
+COLL = os.environ.get("COLL", "bookings")         # default collection = bookings
 
-MONGODB_URI = os.environ.get("MONGODB_URI")
-if not MONGODB_URI:
+if not MONGO_URI:
     raise Exception("Please set the MONGO_URI environment variable in Render")
 
-
-
-# # --- CONFIG ---
-# MONGODB_URI = os.getenv("MONGODB_URI", "mongodb+srv://ayush16r:Ayush16r@healxtrail.nlpleiz.mongodb.net/?retryWrites=true&w=majority&appName=HealXtrail")
-# DB_NAME = os.getenv("DB_NAME", "mydb")   # your DB
-# COLL = "bookings"                       # your collection
-
-client = MongoClient(MONGODB_URI)
+client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
 coll = db[COLL]
 
@@ -35,7 +30,8 @@ DEPT_SERVICE_TIME = {
 
 # --- SSE update counter ---
 update_counter = {"val": 0}
-def notify_update(): update_counter["val"] += 1
+def notify_update():
+    update_counter["val"] += 1
 
 # --- HELPERS ---
 def compute_stats():
@@ -99,9 +95,11 @@ def search():
     if not doc:
         return jsonify({"error": "Not found"}), 404
 
+    # If status missing → set to waiting
     if "status" not in doc:
         coll.update_one({"_id": doc["_id"]}, {"$set": {"status": "waiting", "created_at": datetime.utcnow()}})
 
+    # If no in-progress → move oldest waiting to in-progress
     if coll.count_documents({"status": "in_progress"}) == 0:
         oldest = coll.find_one({"status": "waiting"}, sort=[("created_at", 1)])
         if oldest:
@@ -118,12 +116,15 @@ def complete(id):
         return jsonify({"error": "Invalid ID"}), 400
 
     now = datetime.utcnow()
-    result = coll.update_one({"_id": _id, "status": "in_progress"},
-                             {"$set": {"status": "completed", "completed_at": now}})
+    result = coll.update_one(
+        {"_id": _id, "status": "in_progress"},
+        {"$set": {"status": "completed", "completed_at": now}}
+    )
 
     if result.matched_count == 0:
         return jsonify({"error": "No in-progress appointment with that ID"}), 404
 
+    # Move next waiting → in-progress
     next_wait = coll.find_one({"status": "waiting"}, sort=[("created_at", 1)])
     if next_wait:
         coll.update_one({"_id": next_wait["_id"]}, {"$set": {"status": "in_progress", "started_at": now}})
