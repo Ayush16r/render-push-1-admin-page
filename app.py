@@ -1,7 +1,8 @@
+# app.py
 from flask import Flask, render_template, request, jsonify, Response
 from pymongo import MongoClient
 from bson.objectid import ObjectId
-from datetime import datetime
+from datetime import datetime, timezone
 import os, time, json
 
 app = Flask(__name__)
@@ -16,7 +17,8 @@ if not MONGO_URI:
 
 client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
-coll = db[COLL]
+bookings_col = db[COLL]
+updates_col = db.get_collection("updates")  # used to publish change events (DB-backed notifications)
 
 # --- DEPT SERVICE TIMES ---
 DEPT_SERVICE_TIME = {
@@ -28,25 +30,50 @@ DEPT_SERVICE_TIME = {
     "Cardiology": 15
 }
 
-# --- SSE update counter ---
-update_counter = {"val": 0}
+# ---------------- Notification helpers (DB-backed) ----------------
 def notify_update():
-    update_counter["val"] += 1
+    """Insert a small update doc so all server workers can detect a change."""
+    try:
+        updates_col.insert_one({"ts": datetime.now(timezone.utc)})
+    except Exception:
+        # keep quiet in production if notify fails; app still functions
+        pass
 
-# --- HELPERS ---
+def get_latest_update_ts():
+    """Return latest update timestamp (UTC) or epoch if none."""
+    last = updates_col.find_one(sort=[("ts", -1)])
+    return last["ts"] if last and "ts" in last else datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+# ---------------- Helpers ----------------
+def _sort_key_by_created_or_oid(doc):
+    """Return a datetime for sorting: prefer created_at, fallback to ObjectId generation time."""
+    created = doc.get("created_at")
+    if created:
+        # ensure tz-aware UTC if naive
+        if created.tzinfo is None:
+            return created.replace(tzinfo=timezone.utc)
+        return created
+    # ObjectId generation time is timezone-aware (UTC)
+    return doc["_id"].generation_time.replace(tzinfo=timezone.utc)
+
 def compute_stats():
-    waiting = list(coll.find({"status": "waiting"}).sort("created_at", 1))
-    in_progress = coll.find_one({"status": "in_progress"})
-    completed_count = coll.count_documents({"status": "completed"})
+    # Fetch waiting docs and sort by created_at (or ObjectId time) FIFO
+    waiting_docs = list(bookings_col.find({"status": "waiting"}))
+    waiting_sorted = sorted(waiting_docs, key=_sort_key_by_created_or_oid)
 
-    queue_len = len(waiting)
+    in_progress = bookings_col.find_one({"status": "in_progress"})
+    # completed_today: count completed documents since today's UTC midnight
+    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    completed_today = bookings_col.count_documents({"status": "completed", "completed_at": {"$gte": today_start}})
+
+    queue_len = len(waiting_sorted)
     total_min = 0
 
     if in_progress:
         dept = in_progress.get("department", "General")
         total_min += DEPT_SERVICE_TIME.get(dept, 10)
 
-    for appt in waiting:
+    for appt in waiting_sorted:
         dept = appt.get("department", "General")
         total_min += DEPT_SERVICE_TIME.get(dept, 10)
 
@@ -55,7 +82,7 @@ def compute_stats():
         "name": a.get("patient_name"),
         "department": a.get("department"),
         "booking_id": a.get("booking_id")
-    } for a in waiting]
+    } for a in waiting_sorted]
 
     in_prog = None
     if in_progress:
@@ -69,14 +96,14 @@ def compute_stats():
     return {
         "queue_length": queue_len,
         "estimated_wait_min": total_min,
-        "completed_today": completed_count,
+        "completed_today": completed_today,
         "waiting": waiting_list,
         "in_progress": in_prog,
         "service_time_map": DEPT_SERVICE_TIME,
-        "update_counter": update_counter["val"]
+        "latest_update_ts": get_latest_update_ts().isoformat()
     }
 
-# --- ROUTES ---
+# ---------------- Routes ----------------
 @app.route("/")
 def index():
     return render_template("index.html", departments=list(DEPT_SERVICE_TIME.keys()))
@@ -91,19 +118,27 @@ def search():
     if not booking_id:
         return jsonify({"error": "Booking ID required"}), 400
 
-    doc = coll.find_one({"booking_id": booking_id})
+    doc = bookings_col.find_one({"booking_id": booking_id})
     if not doc:
         return jsonify({"error": "Not found"}), 404
 
-    # If status missing → set to waiting
+    # Ensure every booking has a status + created_at (so sorting is consistent)
+    update_fields = {}
     if "status" not in doc:
-        coll.update_one({"_id": doc["_id"]}, {"$set": {"status": "waiting", "created_at": datetime.utcnow()}})
+        update_fields["status"] = "waiting"
+    if "created_at" not in doc:
+        update_fields["created_at"] = datetime.now(timezone.utc)
+    if update_fields:
+        bookings_col.update_one({"_id": doc["_id"]}, {"$set": update_fields})
+        doc.update(update_fields)
 
-    # If no in-progress → move oldest waiting to in-progress
-    if coll.count_documents({"status": "in_progress"}) == 0:
-        oldest = coll.find_one({"status": "waiting"}, sort=[("created_at", 1)])
-        if oldest:
-            coll.update_one({"_id": oldest["_id"]}, {"$set": {"status": "in_progress", "started_at": datetime.utcnow()}})
+    # If no one is currently in_progress, move the oldest waiting to in_progress (FIFO)
+    if bookings_col.count_documents({"status": "in_progress"}) == 0:
+        # compute the oldest waiting using the same sort key logic
+        waiting_docs = list(bookings_col.find({"status": "waiting"}))
+        if waiting_docs:
+            oldest = sorted(waiting_docs, key=_sort_key_by_created_or_oid)[0]
+            bookings_col.update_one({"_id": oldest["_id"]}, {"$set": {"status": "in_progress", "started_at": datetime.now(timezone.utc)}})
 
     notify_update()
     return jsonify({"ok": True, "id": str(doc["_id"])})
@@ -112,11 +147,11 @@ def search():
 def complete(id):
     try:
         _id = ObjectId(id)
-    except:
+    except Exception:
         return jsonify({"error": "Invalid ID"}), 400
 
-    now = datetime.utcnow()
-    result = coll.update_one(
+    now = datetime.now(timezone.utc)
+    result = bookings_col.update_one(
         {"_id": _id, "status": "in_progress"},
         {"$set": {"status": "completed", "completed_at": now}}
     )
@@ -125,9 +160,10 @@ def complete(id):
         return jsonify({"error": "No in-progress appointment with that ID"}), 404
 
     # Move next waiting → in-progress
-    next_wait = coll.find_one({"status": "waiting"}, sort=[("created_at", 1)])
-    if next_wait:
-        coll.update_one({"_id": next_wait["_id"]}, {"$set": {"status": "in_progress", "started_at": now}})
+    waiting_docs = list(bookings_col.find({"status": "waiting"}))
+    if waiting_docs:
+        next_wait = sorted(waiting_docs, key=_sort_key_by_created_or_oid)[0]
+        bookings_col.update_one({"_id": next_wait["_id"]}, {"$set": {"status": "in_progress", "started_at": now}})
 
     notify_update()
     return jsonify({"ok": True, "stats": compute_stats()})
@@ -138,15 +174,28 @@ def stats():
 
 @app.route("/stream")
 def stream():
-    def event_stream(last_val):
-        current = last_val
-        while True:
-            if update_counter["val"] != current:
-                current = update_counter["val"]
-                data = compute_stats()
-                yield f"id: {current}\nevent: update\ndata: {json.dumps(data)}\n\n"
-            time.sleep(0.5)
-    return Response(event_stream(update_counter["val"]), mimetype="text/event-stream")
+    """Server-Sent Events stream. Sends initial state immediately, then sends updates when DB gets a new update doc."""
+    def event_stream():
+        last_ts = get_latest_update_ts()
 
+        # Send initial payload right away
+        data = compute_stats()
+        yield f"event: update\ndata: {json.dumps(data)}\n\n"
+
+        # Poll for changes (DB-backed signal) — safe to run with multiple workers
+        while True:
+            latest = get_latest_update_ts()
+            if latest > last_ts:
+                last_ts = latest
+                data = compute_stats()
+                yield f"event: update\ndata: {json.dumps(data)}\n\n"
+            time.sleep(0.8)
+
+    return Response(event_stream(), mimetype="text/event-stream")
+
+# ---------------- Run (local) ----------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True, threaded=True)
+    # For local testing only. On Render use gunicorn start command.
+    port = int(os.environ.get("PORT", 5000))
+    debug = os.environ.get("FLASK_DEBUG", "0") == "1"
+    app.run(host="0.0.0.0", port=port, debug=debug)
