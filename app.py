@@ -8,8 +8,8 @@ app = Flask(__name__)
 
 # ---------------- MongoDB Setup ----------------
 
-MONGO_URI = os.environ.get("MONGO_URI")
-if not MONGO_URI:
+MONGODB_URI = os.environ.get("MONGODB_URI")
+if not MONGODB_URI:
     raise Exception("Please set the MONGO_URI environment variable in Render")
 
 
