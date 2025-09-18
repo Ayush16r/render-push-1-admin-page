@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>City Medical Center — Live Dashboard</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>City Medical Center</h1>
+      <p class="subtitle">Real-time Appointment Management System</p>
+    </header>
+
+    <main>
+      <aside class="left-card">
+        <div class="card">
+          <h2>Search Appointment</h2>
+          <form id="searchForm">
+            <label>Booking ID
+              <input type="text" id="booking_id" placeholder="Enter booking ID" required />
+            </label>
+            <button type="submit" class="green">Search & Add to Queue</button>
+          </form>
+        </div>
+      </aside>
+
+      <section class="right-column">
+        <div class="live-stats">
+          <div class="stat card">
+            <h3>Queue Length</h3>
+            <div id="queueLength" class="big">0</div>
+            <div class="muted">patients waiting</div>
+          </div>
+
+          <div class="stat card">
+            <h3>Est. Wait Time</h3>
+            <div id="estWait" class="big">0 min</div>
+            <div class="muted">for next patient</div>
+          </div>
+
+          <div class="stat card">
+            <h3>Completed Today</h3>
+            <div id="completed" class="big">0</div>
+            <div class="muted">patients served</div>
+          </div>
+        </div>
+
+        <div id="currentlyServing" class="card blue">
+          <h3>Currently Serving</h3>
+          <div id="currentCard">
+            <div class="muted">No one is being served right now</div>
+          </div>
+          <div id="completeBtnContainer"></div>
+        </div>
+
+        <div class="card">
+          <h3>Live Queue</h3>
+          <label for="deptFilter">Filter by Department:</label>
+          <select id="deptFilter">
+            <option value="All">All Departments</option>
+            {% for dept in departments %}
+              <option value="{{ dept }}">{{ dept }}</option>
+            {% endfor %}
+          </select>
+
+          <div id="liveQueue">
+            <div class="muted">No patients in queue</div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/static/main.js"></script>
+</body>
+</html>
