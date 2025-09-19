@@ -36,7 +36,6 @@ def notify_update():
     try:
         updates_col.insert_one({"ts": datetime.now(timezone.utc)})
     except Exception:
-        # keep quiet in production if notify fails; app still functions
         pass
 
 def get_latest_update_ts():
@@ -47,14 +46,27 @@ def get_latest_update_ts():
 # ---------------- Helpers ----------------
 def _sort_key_by_created_or_oid(doc):
     """Return a datetime for sorting: prefer created_at, fallback to ObjectId generation time."""
-    created = doc.get("created_at")
-    if created:
-        # ensure tz-aware UTC if naive
-        if created.tzinfo is None:
-            return created.replace(tzinfo=timezone.utc)
-        return created
-    # ObjectId generation time is timezone-aware (UTC)
-    return doc["_id"].generation_time.replace(tzinfo=timezone.utc)
+    try:
+        created = doc.get("created_at")
+        if created:
+            if created.tzinfo is None:
+                return created.replace(tzinfo=timezone.utc)
+            return created
+        return doc["_id"].generation_time.replace(tzinfo=timezone.utc)
+    except Exception:
+        return datetime.now(timezone.utc)
+
+def ensure_defaults(doc_id, doc):
+    """Make sure a booking has status + created_at."""
+    update_fields = {}
+    if "status" not in doc:
+        update_fields["status"] = "waiting"
+    if "created_at" not in doc:
+        update_fields["created_at"] = datetime.now(timezone.utc)
+    if update_fields:
+        bookings_col.update_one({"_id": doc_id}, {"$set": update_fields})
+        doc.update(update_fields)
+    return doc
 
 def compute_stats():
     # Fetch waiting docs and sort by created_at (or ObjectId time) FIFO
@@ -62,7 +74,6 @@ def compute_stats():
     waiting_sorted = sorted(waiting_docs, key=_sort_key_by_created_or_oid)
 
     in_progress = bookings_col.find_one({"status": "in_progress"})
-    # completed_today: count completed documents since today's UTC midnight
     today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     completed_today = bookings_col.count_documents({"status": "completed", "completed_at": {"$gte": today_start}})
 
@@ -78,11 +89,12 @@ def compute_stats():
         total_min += DEPT_SERVICE_TIME.get(dept, 10)
 
     waiting_list = [{
+        "sno": idx + 1,
         "id": str(a["_id"]),
         "name": a.get("patient_name"),
         "department": a.get("department"),
         "booking_id": a.get("booking_id")
-    } for a in waiting_sorted]
+    } for idx, a in enumerate(waiting_sorted)]
 
     in_prog = None
     if in_progress:
@@ -122,23 +134,17 @@ def search():
     if not doc:
         return jsonify({"error": "Not found"}), 404
 
-    # Ensure every booking has a status + created_at (so sorting is consistent)
-    update_fields = {}
-    if "status" not in doc:
-        update_fields["status"] = "waiting"
-    if "created_at" not in doc:
-        update_fields["created_at"] = datetime.now(timezone.utc)
-    if update_fields:
-        bookings_col.update_one({"_id": doc["_id"]}, {"$set": update_fields})
-        doc.update(update_fields)
+    doc = ensure_defaults(doc["_id"], doc)
 
     # If no one is currently in_progress, move the oldest waiting to in_progress (FIFO)
     if bookings_col.count_documents({"status": "in_progress"}) == 0:
-        # compute the oldest waiting using the same sort key logic
         waiting_docs = list(bookings_col.find({"status": "waiting"}))
         if waiting_docs:
             oldest = sorted(waiting_docs, key=_sort_key_by_created_or_oid)[0]
-            bookings_col.update_one({"_id": oldest["_id"]}, {"$set": {"status": "in_progress", "started_at": datetime.now(timezone.utc)}})
+            bookings_col.update_one(
+                {"_id": oldest["_id"]},
+                {"$set": {"status": "in_progress", "started_at": datetime.now(timezone.utc)}}
+            )
 
     notify_update()
     return jsonify({"ok": True, "id": str(doc["_id"])})
@@ -163,14 +169,20 @@ def complete(id):
     waiting_docs = list(bookings_col.find({"status": "waiting"}))
     if waiting_docs:
         next_wait = sorted(waiting_docs, key=_sort_key_by_created_or_oid)[0]
-        bookings_col.update_one({"_id": next_wait["_id"]}, {"$set": {"status": "in_progress", "started_at": now}})
+        bookings_col.update_one(
+            {"_id": next_wait["_id"]},
+            {"$set": {"status": "in_progress", "started_at": now}}
+        )
 
     notify_update()
     return jsonify({"ok": True, "stats": compute_stats()})
 
 @app.route("/api/stats")
 def stats():
-    return jsonify(compute_stats())
+    stats_data = compute_stats()
+    # Debugging: show all docs if needed
+    stats_data["all_docs"] = [json.loads(json.dumps(doc, default=str)) for doc in bookings_col.find()]
+    return jsonify(stats_data)
 
 @app.route("/stream")
 def stream():
@@ -195,7 +207,6 @@ def stream():
 
 # ---------------- Run (local) ----------------
 if __name__ == "__main__":
-    # For local testing only. On Render use gunicorn start command.
     port = int(os.environ.get("PORT", 5000))
     debug = os.environ.get("FLASK_DEBUG", "0") == "1"
     app.run(host="0.0.0.0", port=port, debug=debug)
